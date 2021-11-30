@@ -1,4 +1,4 @@
-// Copyright 2020 The Prometheus Authors
+// Copyright 2021 The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -13,6 +13,14 @@
 
 // +build linux
 
-package procfs
+package sysfs
 
-var parseCPUInfo = parseCPUInfoMips
+import (
+	"path/filepath"
+
+	"github.com/prometheus/procfs/internal/util"
+)
+
+func readDRMCardField(card, field string) (string, error) {
+	return util.SysReadFile(filepath.Join(card, "device", field))
+}
