@@ -18,30 +18,37 @@ package collector
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"sync"
 
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/procfs"
-	"gopkg.in/alecthomas/kingpin.v2"
+	"github.com/prometheus/procfs/sysfs"
+	"golang.org/x/exp/maps"
+	"golang.org/x/exp/slices"
 )
 
 type cpuCollector struct {
 	fs                 procfs.FS
 	cpu                *prometheus.Desc
 	cpuInfo            *prometheus.Desc
+	cpuFrequencyHz     *prometheus.Desc
 	cpuFlagsInfo       *prometheus.Desc
 	cpuBugsInfo        *prometheus.Desc
 	cpuGuest           *prometheus.Desc
 	cpuCoreThrottle    *prometheus.Desc
 	cpuPackageThrottle *prometheus.Desc
+	cpuIsolated        *prometheus.Desc
 	logger             log.Logger
-	cpuStats           []procfs.CPUStat
+	cpuStats           map[int64]procfs.CPUStat
 	cpuStatsMutex      sync.Mutex
+	isolatedCpus       []uint16
 
 	cpuFlagsIncludeRegexp *regexp.Regexp
 	cpuBugsIncludeRegexp  *regexp.Regexp
@@ -68,6 +75,20 @@ func NewCPUCollector(logger log.Logger) (Collector, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open procfs: %w", err)
 	}
+
+	sysfs, err := sysfs.NewFS(*sysPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open sysfs: %w", err)
+	}
+
+	isolcpus, err := sysfs.IsolatedCPUs()
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("Unable to get isolated cpus: %w", err)
+		}
+		level.Debug(logger).Log("msg", "Could not open isolated file", "error", err)
+	}
+
 	c := &cpuCollector{
 		fs:  fs,
 		cpu: nodeCPUSecondsDesc,
@@ -75,6 +96,11 @@ func NewCPUCollector(logger log.Logger) (Collector, error) {
 			prometheus.BuildFQName(namespace, cpuCollectorSubsystem, "info"),
 			"CPU information from /proc/cpuinfo.",
 			[]string{"package", "core", "cpu", "vendor", "family", "model", "model_name", "microcode", "stepping", "cachesize"}, nil,
+		),
+		cpuFrequencyHz: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, cpuCollectorSubsystem, "frequency_hertz"),
+			"CPU frequency in hertz from /proc/cpuinfo.",
+			[]string{"package", "core", "cpu"}, nil,
 		),
 		cpuFlagsInfo: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, cpuCollectorSubsystem, "flag_info"),
@@ -101,7 +127,14 @@ func NewCPUCollector(logger log.Logger) (Collector, error) {
 			"Number of times this CPU package has been throttled.",
 			[]string{"package"}, nil,
 		),
-		logger: logger,
+		cpuIsolated: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, cpuCollectorSubsystem, "isolated"),
+			"Whether each core is isolated, information from /sys/devices/system/cpu/isolated.",
+			[]string{"cpu"}, nil,
+		),
+		logger:       logger,
+		isolatedCpus: isolcpus,
+		cpuStats:     make(map[int64]procfs.CPUStat),
 	}
 	err = c.compileIncludeFlags(flagsInclude, bugsInclude)
 	if err != nil {
@@ -142,6 +175,9 @@ func (c *cpuCollector) Update(ch chan<- prometheus.Metric) error {
 	if err := c.updateStat(ch); err != nil {
 		return err
 	}
+	if c.isolatedCpus != nil {
+		c.updateIsolated(ch)
+	}
 	return c.updateThermalThrottle(ch)
 }
 
@@ -165,6 +201,20 @@ func (c *cpuCollector) updateInfo(ch chan<- prometheus.Metric) error {
 			cpu.Microcode,
 			cpu.Stepping,
 			cpu.CacheSize)
+	}
+
+	cpuFreqEnabled, ok := collectorState["cpufreq"]
+	if !ok || cpuFreqEnabled == nil {
+		level.Debug(c.logger).Log("cpufreq key missing or nil value in collectorState map", err)
+	} else if !*cpuFreqEnabled {
+		for _, cpu := range info {
+			ch <- prometheus.MustNewConstMetric(c.cpuFrequencyHz,
+				prometheus.GaugeValue,
+				cpu.CPUMHz*1e6,
+				cpu.PhysicalID,
+				cpu.CoreID,
+				strconv.Itoa(int(cpu.Processor)))
+		}
 	}
 
 	if len(info) != 0 {
@@ -276,6 +326,14 @@ func (c *cpuCollector) updateThermalThrottle(ch chan<- prometheus.Metric) error 
 	return nil
 }
 
+// updateIsolated reads /sys/devices/system/cpu/isolated through sysfs and exports isolation level metrics.
+func (c *cpuCollector) updateIsolated(ch chan<- prometheus.Metric) {
+	for _, cpu := range c.isolatedCpus {
+		cpuNum := strconv.Itoa(int(cpu))
+		ch <- prometheus.MustNewConstMetric(c.cpuIsolated, prometheus.GaugeValue, 1.0, cpuNum)
+	}
+}
+
 // updateStat reads /proc/stat through procfs and exports CPU-related metrics.
 func (c *cpuCollector) updateStat(ch chan<- prometheus.Metric) error {
 	stats, err := c.fs.Stat()
@@ -289,7 +347,7 @@ func (c *cpuCollector) updateStat(ch chan<- prometheus.Metric) error {
 	c.cpuStatsMutex.Lock()
 	defer c.cpuStatsMutex.Unlock()
 	for cpuID, cpuStat := range c.cpuStats {
-		cpuNum := strconv.Itoa(cpuID)
+		cpuNum := strconv.Itoa(int(cpuID))
 		ch <- prometheus.MustNewConstMetric(c.cpu, prometheus.CounterValue, cpuStat.User, cpuNum, "user")
 		ch <- prometheus.MustNewConstMetric(c.cpu, prometheus.CounterValue, cpuStat.Nice, cpuNum, "nice")
 		ch <- prometheus.MustNewConstMetric(c.cpu, prometheus.CounterValue, cpuStat.System, cpuNum, "system")
@@ -310,82 +368,90 @@ func (c *cpuCollector) updateStat(ch chan<- prometheus.Metric) error {
 }
 
 // updateCPUStats updates the internal cache of CPU stats.
-func (c *cpuCollector) updateCPUStats(newStats []procfs.CPUStat) {
+func (c *cpuCollector) updateCPUStats(newStats map[int64]procfs.CPUStat) {
 
 	// Acquire a lock to update the stats.
 	c.cpuStatsMutex.Lock()
 	defer c.cpuStatsMutex.Unlock()
 
 	// Reset the cache if the list of CPUs has changed.
-	if len(c.cpuStats) != len(newStats) {
-		c.cpuStats = make([]procfs.CPUStat, len(newStats))
+	for i, n := range newStats {
+		cpuStats := c.cpuStats[i]
+
+		// If idle jumps backwards by more than X seconds, assume we had a hotplug event and reset the stats for this CPU.
+		if (cpuStats.Idle - n.Idle) >= jumpBackSeconds {
+			level.Debug(c.logger).Log("msg", jumpBackDebugMessage, "cpu", i, "old_value", cpuStats.Idle, "new_value", n.Idle)
+			cpuStats = procfs.CPUStat{}
+		}
+
+		if n.Idle >= cpuStats.Idle {
+			cpuStats.Idle = n.Idle
+		} else {
+			level.Debug(c.logger).Log("msg", "CPU Idle counter jumped backwards", "cpu", i, "old_value", cpuStats.Idle, "new_value", n.Idle)
+		}
+
+		if n.User >= cpuStats.User {
+			cpuStats.User = n.User
+		} else {
+			level.Debug(c.logger).Log("msg", "CPU User counter jumped backwards", "cpu", i, "old_value", cpuStats.User, "new_value", n.User)
+		}
+
+		if n.Nice >= cpuStats.Nice {
+			cpuStats.Nice = n.Nice
+		} else {
+			level.Debug(c.logger).Log("msg", "CPU Nice counter jumped backwards", "cpu", i, "old_value", cpuStats.Nice, "new_value", n.Nice)
+		}
+
+		if n.System >= cpuStats.System {
+			cpuStats.System = n.System
+		} else {
+			level.Debug(c.logger).Log("msg", "CPU System counter jumped backwards", "cpu", i, "old_value", cpuStats.System, "new_value", n.System)
+		}
+
+		if n.Iowait >= cpuStats.Iowait {
+			cpuStats.Iowait = n.Iowait
+		} else {
+			level.Debug(c.logger).Log("msg", "CPU Iowait counter jumped backwards", "cpu", i, "old_value", cpuStats.Iowait, "new_value", n.Iowait)
+		}
+
+		if n.IRQ >= cpuStats.IRQ {
+			cpuStats.IRQ = n.IRQ
+		} else {
+			level.Debug(c.logger).Log("msg", "CPU IRQ counter jumped backwards", "cpu", i, "old_value", cpuStats.IRQ, "new_value", n.IRQ)
+		}
+
+		if n.SoftIRQ >= cpuStats.SoftIRQ {
+			cpuStats.SoftIRQ = n.SoftIRQ
+		} else {
+			level.Debug(c.logger).Log("msg", "CPU SoftIRQ counter jumped backwards", "cpu", i, "old_value", cpuStats.SoftIRQ, "new_value", n.SoftIRQ)
+		}
+
+		if n.Steal >= cpuStats.Steal {
+			cpuStats.Steal = n.Steal
+		} else {
+			level.Debug(c.logger).Log("msg", "CPU Steal counter jumped backwards", "cpu", i, "old_value", cpuStats.Steal, "new_value", n.Steal)
+		}
+
+		if n.Guest >= cpuStats.Guest {
+			cpuStats.Guest = n.Guest
+		} else {
+			level.Debug(c.logger).Log("msg", "CPU Guest counter jumped backwards", "cpu", i, "old_value", cpuStats.Guest, "new_value", n.Guest)
+		}
+
+		if n.GuestNice >= cpuStats.GuestNice {
+			cpuStats.GuestNice = n.GuestNice
+		} else {
+			level.Debug(c.logger).Log("msg", "CPU GuestNice counter jumped backwards", "cpu", i, "old_value", cpuStats.GuestNice, "new_value", n.GuestNice)
+		}
+
+		c.cpuStats[i] = cpuStats
 	}
 
-	for i, n := range newStats {
-		// If idle jumps backwards by more than X seconds, assume we had a hotplug event and reset the stats for this CPU.
-		if (c.cpuStats[i].Idle - n.Idle) >= jumpBackSeconds {
-			level.Debug(c.logger).Log("msg", jumpBackDebugMessage, "cpu", i, "old_value", c.cpuStats[i].Idle, "new_value", n.Idle)
-			c.cpuStats[i] = procfs.CPUStat{}
-		}
-
-		if n.Idle >= c.cpuStats[i].Idle {
-			c.cpuStats[i].Idle = n.Idle
-		} else {
-			level.Debug(c.logger).Log("msg", "CPU Idle counter jumped backwards", "cpu", i, "old_value", c.cpuStats[i].Idle, "new_value", n.Idle)
-		}
-
-		if n.User >= c.cpuStats[i].User {
-			c.cpuStats[i].User = n.User
-		} else {
-			level.Debug(c.logger).Log("msg", "CPU User counter jumped backwards", "cpu", i, "old_value", c.cpuStats[i].User, "new_value", n.User)
-		}
-
-		if n.Nice >= c.cpuStats[i].Nice {
-			c.cpuStats[i].Nice = n.Nice
-		} else {
-			level.Debug(c.logger).Log("msg", "CPU Nice counter jumped backwards", "cpu", i, "old_value", c.cpuStats[i].Nice, "new_value", n.Nice)
-		}
-
-		if n.System >= c.cpuStats[i].System {
-			c.cpuStats[i].System = n.System
-		} else {
-			level.Debug(c.logger).Log("msg", "CPU System counter jumped backwards", "cpu", i, "old_value", c.cpuStats[i].System, "new_value", n.System)
-		}
-
-		if n.Iowait >= c.cpuStats[i].Iowait {
-			c.cpuStats[i].Iowait = n.Iowait
-		} else {
-			level.Debug(c.logger).Log("msg", "CPU Iowait counter jumped backwards", "cpu", i, "old_value", c.cpuStats[i].Iowait, "new_value", n.Iowait)
-		}
-
-		if n.IRQ >= c.cpuStats[i].IRQ {
-			c.cpuStats[i].IRQ = n.IRQ
-		} else {
-			level.Debug(c.logger).Log("msg", "CPU IRQ counter jumped backwards", "cpu", i, "old_value", c.cpuStats[i].IRQ, "new_value", n.IRQ)
-		}
-
-		if n.SoftIRQ >= c.cpuStats[i].SoftIRQ {
-			c.cpuStats[i].SoftIRQ = n.SoftIRQ
-		} else {
-			level.Debug(c.logger).Log("msg", "CPU SoftIRQ counter jumped backwards", "cpu", i, "old_value", c.cpuStats[i].SoftIRQ, "new_value", n.SoftIRQ)
-		}
-
-		if n.Steal >= c.cpuStats[i].Steal {
-			c.cpuStats[i].Steal = n.Steal
-		} else {
-			level.Debug(c.logger).Log("msg", "CPU Steal counter jumped backwards", "cpu", i, "old_value", c.cpuStats[i].Steal, "new_value", n.Steal)
-		}
-
-		if n.Guest >= c.cpuStats[i].Guest {
-			c.cpuStats[i].Guest = n.Guest
-		} else {
-			level.Debug(c.logger).Log("msg", "CPU Guest counter jumped backwards", "cpu", i, "old_value", c.cpuStats[i].Guest, "new_value", n.Guest)
-		}
-
-		if n.GuestNice >= c.cpuStats[i].GuestNice {
-			c.cpuStats[i].GuestNice = n.GuestNice
-		} else {
-			level.Debug(c.logger).Log("msg", "CPU GuestNice counter jumped backwards", "cpu", i, "old_value", c.cpuStats[i].GuestNice, "new_value", n.GuestNice)
-		}
+	// Remove offline CPUs.
+	if len(newStats) != len(c.cpuStats) {
+		onlineCPUIds := maps.Keys(newStats)
+		maps.DeleteFunc(c.cpuStats, func(key int64, item procfs.CPUStat) bool {
+			return !slices.Contains(onlineCPUIds, key)
+		})
 	}
 }

@@ -11,21 +11,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !notextfile
+// +build !notextfile
+
 package collector
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/promlog"
 	"github.com/prometheus/common/promlog/flag"
-	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 type collectorAdapter struct {
@@ -95,6 +98,22 @@ func TestTextfileCollector(t *testing.T) {
 			path: "fixtures/textfile/*_extra_dimension",
 			out:  "fixtures/textfile/glob_extra_dimension.out",
 		},
+		{
+			path: "fixtures/textfile/metrics_merge_empty_help",
+			out:  "fixtures/textfile/metrics_merge_empty_help.out",
+		},
+		{
+			path: "fixtures/textfile/metrics_merge_no_help",
+			out:  "fixtures/textfile/metrics_merge_no_help.out",
+		},
+		{
+			path: "fixtures/textfile/metrics_merge_same_help",
+			out:  "fixtures/textfile/metrics_merge_same_help.out",
+		},
+		{
+			path: "fixtures/textfile/metrics_merge_different_help",
+			out:  "fixtures/textfile/metrics_merge_different_help.out",
+		},
 	}
 
 	for i, test := range tests {
@@ -117,10 +136,10 @@ func TestTextfileCollector(t *testing.T) {
 		registry.MustRegister(collectorAdapter{c})
 
 		rw := httptest.NewRecorder()
-		promhttp.HandlerFor(registry, promhttp.HandlerOpts{}).ServeHTTP(rw, &http.Request{})
+		promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorHandling: promhttp.ContinueOnError}).ServeHTTP(rw, &http.Request{})
 		got := string(rw.Body.String())
 
-		want, err := ioutil.ReadFile(test.out)
+		want, err := os.ReadFile(test.out)
 		if err != nil {
 			t.Fatalf("%d. error reading fixture file %s: %s", i, test.out, err)
 		}

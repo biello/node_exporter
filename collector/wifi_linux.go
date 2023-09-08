@@ -20,15 +20,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/mdlayher/wifi"
 	"github.com/prometheus/client_golang/prometheus"
-	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 type wifiCollector struct {
@@ -366,7 +365,7 @@ type mockWifiStater struct {
 }
 
 func (s *mockWifiStater) unmarshalJSONFile(filename string, v interface{}) error {
-	b, err := ioutil.ReadFile(filepath.Join(s.fixtures, filename))
+	b, err := os.ReadFile(filepath.Join(s.fixtures, filename))
 	if err != nil {
 		return err
 	}

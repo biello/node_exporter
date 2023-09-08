@@ -11,22 +11,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !noipvs
+// +build !noipvs
+
 package collector
 
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/go-kit/log"
 
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 func TestIPVSCollector(t *testing.T) {
@@ -189,7 +192,7 @@ func TestIPVSCollectorResponse(t *testing.T) {
 			rw := httptest.NewRecorder()
 			promhttp.InstrumentMetricHandler(registry, promhttp.HandlerFor(registry, promhttp.HandlerOpts{})).ServeHTTP(rw, &http.Request{})
 
-			wantMetrics, err := ioutil.ReadFile(test.metricsFile)
+			wantMetrics, err := os.ReadFile(test.metricsFile)
 			if err != nil {
 				t.Fatalf("unable to read input test file %s: %s", test.metricsFile, err)
 			}
@@ -209,9 +212,8 @@ func TestIPVSCollectorResponse(t *testing.T) {
 					if want == got {
 						// this is a line we are interested in, and it is correct
 						continue wantLoop
-					} else {
-						gotLinesIdx++
 					}
+					gotLinesIdx++
 				}
 				// if this point is reached, the line we want was missing
 				t.Fatalf("Missing expected output line(s), first missing line is %s", want)
